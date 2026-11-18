@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Run from inside your project (a git repo). One isolated agent box per feature.
+set -euo pipefail
+TOOL="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+SECRETS="${AGENT_BOX_CONFIG:-$HOME/.config/agent-box}"
+
+usage() {
+  cat <<'EOF'
+Run from inside your project's git repo:
+
+agent new    NAME [--branch B]   create the box (clones this repo, branch agent/NAME)
+agent task   NAME FILE           give it a task file (any text/markdown)
+agent claude NAME [args]         work with it live (interactive session)
+agent run    NAME ["prompt"]     let it run by itself in the background
+agent logs   NAME                follow the background run's output
+agent status NAME                recent commits and working tree
+agent shell  NAME                bash inside the box
+agent stop NAME | start NAME     pause / resume (state kept)
+agent rm     NAME                delete box and its volumes
+agent ls                         list boxes
+
+Picked up automatically: repo URL (git remote origin), base branch (current
+branch), app env (<project>/.env.agent if present).
+Credentials live once in ~/.config/agent-box/{gh_token,claude_token}.
+EOF
+}
+
+to_https() {
+  case "$1" in
+    git@*:*)      u="${1#git@}"; echo "https://${u/:/\/}" ;;
+    ssh://git@*)  echo "https://${1#ssh://git@}" ;;
+    *)            echo "$1" ;;
+  esac
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help) usage; exit 0 ;;
+  ls) docker compose ls --all --filter name='agent-'; exit 0 ;;
+esac
+
+name="${1:?feature name required}"; shift || true
+BRANCH="agent/$name"
+if [ "$cmd" = new ] && [ "${1:-}" = "--branch" ]; then BRANCH="${2:?}"; shift 2; fi
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || { echo "Run this from inside your project (a git repo)." >&2; exit 1; }
+origin="$(git -C "$root" remote get-url origin 2>/dev/null)" \
+  || { echo "No 'origin' remote found in $root." >&2; exit 1; }
+for f in gh_token claude_token; do
+  [ -s "$SECRETS/$f" ] || { echo "Missing $SECRETS/$f (see README)." >&2; exit 1; }
+done
+
+slug="$(basename "$root" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')"
+current="$(git -C "$root" rev-parse --abbrev-ref HEAD)"
+
+export REPO_URL="$(to_https "$origin")"
+export BASE_BRANCH="${BASE_BRANCH:-$([ "$current" = HEAD ] && echo main || echo "$current")}"
+export BRANCH
+export AGENT_SECRETS_DIR="$SECRETS"
+export APP_ENV_FILE="/dev/null"
+[ -s "$root/.env.agent" ] && APP_ENV_FILE="$root/.env.agent"
+
+dc() { docker compose -f "$TOOL/compose.yml" -p "agent-$slug-$name" "$@"; }
+
+DEFAULT_PROMPT="Read /workspace/TASK.md and complete the task. Commit your work to the current branch as you go, and push the branch when you are done."
+
+case "$cmd" in
+  new)    echo "repo: $REPO_URL  base: $BASE_BRANCH  branch: $BRANCH  app env: $APP_ENV_FILE"
+          dc up -d --build ;;
+  task)   f="${1:?path to task file}"
+          dc exec -T agent sh -c 'cat > /workspace/TASK.md' < "$f" ;;
+  claude) if [ $# -gt 0 ]; then
+            dc exec -w /workspace/repo agent claude "$@"          # e.g. --continue
+          else
+            dc exec -w /workspace/repo agent claude "$DEFAULT_PROMPT"
+          fi ;;
+  run)    prompt="${1:-$DEFAULT_PROMPT}"
+          dc exec -d agent bash -c '
+            cd /workspace/repo
+            c=""; [ -d "$HOME/.claude/projects" ] && c="--continue"
+            claude -p "$1" $c --dangerously-skip-permissions >> /workspace/run.log 2>&1
+          ' _ "$prompt"
+          echo "running. follow with: agent logs $name" ;;
+  logs)   dc exec agent tail -n 80 -f /workspace/run.log ;;
+  status) dc exec -w /workspace/repo agent sh -c 'git log --oneline -5; git status -s' ;;
+  shell)  dc exec -w /workspace/repo agent bash ;;
+  stop)   dc stop ;;
+  start)  dc start ;;
+  rm)     read -rp "Delete box + volumes for '$name'? [y/N] " a
+          [ "$a" = y ] && dc down -v ;;
+  *)      usage; exit 1 ;;
+esac

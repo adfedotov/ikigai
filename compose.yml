@@ -1,0 +1,46 @@
+# Run through bin/agent (it sets project name, repo, branch, secrets path).
+services:
+  agent:
+    build: ./container
+    init: true
+    working_dir: /workspace
+    environment:
+      REPO_URL: ${REPO_URL:?run via bin/agent}
+      BRANCH: ${BRANCH:?}
+      BASE_BRANCH: ${BASE_BRANCH:-main}
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      http_proxy: http://proxy:3128
+      https_proxy: http://proxy:3128
+      NO_PROXY: proxy,localhost,127.0.0.1
+      no_proxy: proxy,localhost,127.0.0.1
+    secrets: [gh_token, claude_token] # files under /run/secrets, not env vars
+    volumes:
+      - workspace:/workspace # repo clone lives here, not on your host
+      - claude-home:/home/node/.claude # session history, survives stop/start
+      - ${APP_ENV_FILE:-/dev/null}:/run/app.env:ro # project's .env.agent, if any
+    networks: [sandbox] # no direct internet
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [proxy]
+
+  proxy:
+    image: ubuntu/squid
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    networks: [sandbox, egress]
+
+secrets:
+  gh_token:
+    file: ${AGENT_SECRETS_DIR:?run via bin/agent}/gh_token
+  claude_token:
+    file: ${AGENT_SECRETS_DIR:?run via bin/agent}/claude_token
+
+volumes:
+  workspace:
+  claude-home:
+
+networks:
+  sandbox:
+    internal: true
+  egress: {}
